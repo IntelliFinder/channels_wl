@@ -1,7 +1,7 @@
 import argparse
 import torch
 from n_body_system.dataset_nbody import NBodyDataset
-from n_body_system.model import GNN, EGNN, Baseline, Linear, EGNN_vel, Linear_dynamics, RF_vel
+from n_body_system.model import GNN, EGNN, Baseline, Linear, EGNN_vel, EGNN_vel_hidden, Linear_dynamics, RF_vel
 import os
 from torch import nn, optim
 import json
@@ -39,7 +39,7 @@ parser.add_argument('--nf', type=int, default=64, metavar='N',
 parser.add_argument('--num_vectors', type=int, default=1, metavar='N',
                     help='number of vector channels')
 parser.add_argument('--model', type=str, default='egnn_vel', metavar='N',
-                    help='available models: gnn, baseline, linear, linear_vel, se3_transformer, egnn_vel, rf_vel, tfn')
+                    help='available models: gnn, baseline, linear, linear_vel, se3_transformer, egnn_vel, egnn_vel_hidden, rf_vel, tfn')
 parser.add_argument('--attention', type=int, default=0, metavar='N',
                     help='attention in the ae model')
 parser.add_argument('--n_layers', type=int, default=4, metavar='N',
@@ -75,7 +75,7 @@ parser.add_argument('--ef_dim', type=int, default=3, metavar='N',
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
-
+print(args.model)
 device = torch.device("cuda" if args.cuda else "cpu")
 loss_mse = nn.MSELoss()
 
@@ -120,6 +120,10 @@ def main():
         model = GNN(input_dim=6, hidden_nf=args.nf, n_layers=args.n_layers, device=device, recurrent=True)
     elif args.model == 'egnn_vel':
         model = EGNN_vel(in_node_nf=1, in_edge_nf=2, hidden_edge_nf=args.nf_edge, 
+                         hidden_node_nf=args.nf_node, hidden_coord_nf=args.nf_coord,device=device, n_layers=args.n_layers,
+                         recurrent=True, norm_diff=args.norm_diff, tanh=args.tanh, num_vectors=args.num_vectors, update_vel=args.update_vel, color_steps=args.color_steps, ef_dim=args.ef_dim)
+    elif args.model == 'egnn_vel_hidden':
+        model = EGNN_vel_hidden(in_node_nf=1, in_edge_nf=2, hidden_edge_nf=args.nf_edge, 
                          hidden_node_nf=args.nf_node, hidden_coord_nf=args.nf_coord,device=device, n_layers=args.n_layers,
                          recurrent=True, norm_diff=args.norm_diff, tanh=args.tanh, num_vectors=args.num_vectors, update_vel=args.update_vel, color_steps=args.color_steps, ef_dim=args.ef_dim)
     elif args.model == 'baseline':
@@ -209,6 +213,12 @@ def train(model, optimizer, epoch, loader, backprop=True):
 
             loc_pred = model(nodes, loc.detach(), edges, edge_attr)
         elif args.model == 'egnn_vel':
+            nodes = torch.sqrt(torch.sum(vel ** 2, dim=1)).unsqueeze(1).detach()
+            rows, cols = edges
+            loc_dist = torch.sum((loc[rows] - loc[cols])**2, 1).unsqueeze(1)  # relative distances among locations
+            edge_attr = torch.cat([edge_attr, loc_dist], 1).detach()  # concatenate all edge properties
+            loc_pred = model(nodes, loc.detach(), edges, vel, edge_attr)
+        elif args.model == 'egnn_vel_hidden':
             nodes = torch.sqrt(torch.sum(vel ** 2, dim=1)).unsqueeze(1).detach()
             rows, cols = edges
             loc_dist = torch.sum((loc[rows] - loc[cols])**2, 1).unsqueeze(1)  # relative distances among locations
