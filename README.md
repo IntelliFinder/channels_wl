@@ -54,7 +54,7 @@ python -u generate_dataset.py --num-train 10000 --seed 43 --sufix small
 
 *WL model + velocity*  
 ```
-python -u main_nbody.py --exp_name exp_1_egnn_vel --model egnn_vel_hidden --max_training_samples 3000 --lr 5e-4 --color_steps 2 --ef_dim 3
+python -u main_nbody.py --exp_name exp_1_egnn_vel --model egnn_vel_hidden --max_training_samples 3000 --lr 5e-4 --num_vectors 3 --color_steps 2 --ef_dim 3
 ```
 
 *EGNN model*  
