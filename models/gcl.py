@@ -158,7 +158,7 @@ class E_GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_edge_nf, hidden_node_nf, hidden_coord_nf,edges_in_d=0,
                 nodes_att_dim=0, act_fn=nn.ReLU(),recurrent=True, coords_weight=1.0,
                 attention=False, clamp=False, norm_diff=False, tanh=False,
-                num_vectors_in=1, num_vectors_out=1, last_layer=False):
+                num_vectors_in=1, num_vectors_out=1, last_layer=False, mp=False):
         super(E_GCL, self).__init__()
         input_edge = input_nf * 2
         self.coords_weight = coords_weight
@@ -173,7 +173,7 @@ class E_GCL(nn.Module):
 
 
         self.edge_mlp = nn.Sequential(
-            nn.Linear(input_edge + num_vectors_in + edges_in_d + hidden_edge_nf, hidden_edge_nf),
+            nn.Linear(input_edge + num_vectors_in + edges_in_d + hidden_edge_nf*(1 + int(mp)), hidden_edge_nf),
             act_fn,
             nn.Linear(hidden_edge_nf, hidden_edge_nf),
             act_fn)
@@ -439,40 +439,33 @@ class E_GCL_vel_hidden(E_GCL):
 
     def __init__(self, input_nf, output_nf, hidden_edge_nf, hidden_node_nf, hidden_coord_nf,
                  edges_in_d=0, nodes_att_dim=0, act_fn=nn.ReLU(), recurrent=True, coords_weight=1.0,
-                 attention=False, norm_diff=False, tanh=False, num_vectors_in=1, num_vectors_out=1, last_layer=False, color_steps=1, ef_dim=3):
+                 attention=False, norm_diff=False, tanh=False, num_vectors_in=1, num_vectors_out=1, last_layer=False, color_steps=1, ef_dim=3, mp=False):
         E_GCL.__init__(self, input_nf, output_nf, hidden_edge_nf, hidden_node_nf, hidden_coord_nf,
                        edges_in_d=edges_in_d, nodes_att_dim=nodes_att_dim, act_fn=act_fn, recurrent=recurrent,
                        coords_weight=coords_weight, attention=attention, norm_diff=norm_diff, tanh=tanh,
-                       num_vectors_in=num_vectors_in, num_vectors_out=num_vectors_out, last_layer=last_layer)
+                       num_vectors_in=num_vectors_in, num_vectors_out=num_vectors_out, last_layer=last_layer, mp=mp)
         self.multi_channel_in = (num_vectors_in==2)
         self.three_channel_in = (num_vectors_in==3)
+        self.multi_channel_out = (num_vectors_out==2)
+        self.three_channel_out = (num_vectors_out==3)
         self.norm_diff = norm_diff
         self.coord_mlp_vel = nn.Sequential(
             nn.Linear(input_nf, hidden_coord_nf),
             act_fn,
             nn.Linear(hidden_coord_nf, num_vectors_in * num_vectors_out))
         hidden_nf = hidden_edge_nf
-        self.edge_mlp_feat = nn.Sequential(
-                    nn.Linear( input_nf*2 + 1 + hidden_nf+edges_in_d, hidden_nf),
-                    act_fn,
-                    nn.Linear(hidden_nf, hidden_nf),
-                    act_fn
-            )#maybe add a layer
-        self.edge_mlp_no_wl = nn.Sequential(
-                    nn.Linear(input_nf * 2 + 10 + edges_in_d, hidden_nf),
-                    act_fn,
-                    nn.Linear(hidden_nf, hidden_nf),
-                    act_fn
-            )#maybe add a layer
+        self.hidden_nf = hidden_nf
+        
         
         
         rbound_upper = 10
+        self.mp_dim = hidden_nf
         
         self.color_steps=color_steps
         self.ef_dim=ef_dim
-        self.init_color = TwoFDisInit(ef_dim=2*(4*ef_dim) + int(self.three_channel_in)*(4*ef_dim), k_tuple_dim=hidden_nf, activation_fn=act_fn)
+        self.init_color = TwoFDisInit(ef_dim=(2*(4*ef_dim) + int(self.three_channel_out or self.three_channel_in)*(4*ef_dim) + int(mp)*2*self.mp_dim), k_tuple_dim=(hidden_nf  + int(mp)*self.mp_dim), activation_fn=act_fn)
         self.rbf_fn_one = rbf_class_mapping["nexpnorm"](
-                    num_rbf=ef_dim*2, 
+                    num_rbf=ef_dim*(1 + int(self.multi_channel_out) + 2*int(self.three_channel_out)), 
                     rbound_upper=rbound_upper, 
                     rbf_trainable=False,
                 )
@@ -488,12 +481,12 @@ class E_GCL_vel_hidden(E_GCL):
         for _ in range(color_steps):
             self.interaction_layers.append(
                     TwoFDisLayer(
-                        hidden_dim=hidden_nf,
+                        hidden_dim=(hidden_nf + int(mp)*self.mp_dim),
                         activation_fn=act_fn,
                         )
                     )
 
-    def mixed_wl(self, edge_index, coord0, vel0, coord1, vel1, coord2=None):
+    def mixed_wl(self, edge_index, coord0, vel0, coord1, vel1, coord2=None, kemb=None):
         row, col = edge_index
         B = coord0.size(0)//5
         # apply WL to batch
@@ -578,9 +571,11 @@ class E_GCL_vel_hidden(E_GCL):
             
         
         #cat two point clouds
-        mixed_dist = torch.cat([mixed_dist0, mixed_dist1], dim=-1)# (B, N, N, 8*ef_dim)
+        mixed_dist = torch.cat([mixed_dist0, mixed_dist1, kemb], dim=-1)# (B, N, N, 8*ef_dim + 2*hidden_nf)
         if coord2!=None:
-            mixed_dist = torch.cat([mixed_dist0, mixed_dist1, mixed_dist2], dim=-1)# (B, N, N, 12*ef_dim)
+            mixed_dist = torch.cat([mixed_dist0, mixed_dist1, mixed_dist2, kemb], dim=-1)# (B, N, N, 12*ef_dim + 2*hidden_nf)
+        
+        
         #run wl
         kemb = self.init_color(mixed_dist)
         for i in range(self.color_steps):
@@ -594,40 +589,43 @@ class E_GCL_vel_hidden(E_GCL):
         
         #assert same sizes
         
-        return kemb[batch, rowidx, colidx]
+        return kemb[batch, rowidx, colidx], kemb
             
 
-    def wl(self, edge_index, coord, vel):
+    def wl(self, edge_index, coord, vel, kemb):
         row, col = edge_index
-        B = coord.size(0)//5
         # apply WL to batch
-        coord, vel = coord.clone().reshape(B, 5, 3), vel.clone().reshape(B, 5, 3) # TODO: 5-body task only now
+        B = coord.size(0)//5
+        output_dim = self.ef_dim*(1 + int(self.multi_channel_out) + 2*int(self.three_channel_out))
+        coord, vel = coord.clone().reshape(B, 5, 3), vel.clone().reshape(B, 5, 3)
         
         coord_dist = coord.unsqueeze(2) - coord.unsqueeze(1) # (B, N, N, 3)
         coord_dist = torch.norm(coord_dist.clone(), dim=-1, keepdim=True) # (B, N, N, 1)
-        rbf_coord_dist = self.rbf_fn_one(coord_dist.reshape(-1, 1)).reshape(B, 5, 5,2*self.ef_dim) # (B, N, N, 2*ef_dim)
+        rbf_coord_dist = self.rbf_fn_one(coord_dist.reshape(-1, 1)).reshape(B, 5, 5,output_dim) # (B, N, N, ef_dim)
         
         vel_dist = vel.unsqueeze(2) - vel.unsqueeze(1) # (B, N, N, 3)
         vel_dist = torch.norm(vel_dist.clone(), dim=-1, keepdim=True) # (B, N, N, 1)
-        rbf_vel_dist = self.rbf_fn_one(vel_dist.reshape(-1, 1)).reshape(B, 5, 5,2*self.ef_dim) # (B, N, N, 2*ef_dim)
+        rbf_vel_dist = self.rbf_fn_one(vel_dist.reshape(-1, 1)).reshape(B, 5, 5,output_dim) # (B, N, N, ef_dim)
         
         mixed_dist = coord.unsqueeze(2) - vel.unsqueeze(1) # (B, N, N, 3)
         mixed_dist_coord = torch.norm(mixed_dist.clone(), dim=-1, keepdim=True) # (B, N, N, 1)
-        rbf_mixed_dist_coord = self.rbf_fn_one(mixed_dist_coord.reshape(-1, 1)).reshape(B, 5, 5,2*self.ef_dim) # (B, N, N, 2*ef_dim)
+        rbf_mixed_dist_coord = self.rbf_fn_one(mixed_dist_coord.reshape(-1, 1)).reshape(B, 5, 5,output_dim) # (B, N, N, ef_dim)
         
         
         mixed_dist_vel = torch.transpose(mixed_dist_coord, dim0=1, dim1=2)
-        rbf_mixed_dist_vel = self.rbf_fn_one(mixed_dist_vel.reshape(-1, 1)).reshape(B, 5, 5,2*self.ef_dim) # (B, N, N, 2*ef_dim)
+        rbf_mixed_dist_vel = self.rbf_fn_one(mixed_dist_vel.reshape(-1, 1)).reshape(B, 5, 5,output_dim) # (B, N, N, ef_dim)
         
         #add norms 
-        vel_norms = torch.diag_embed(torch.linalg.vector_norm(vel, ord=2, dim=2)).unsqueeze(3) # (B, N, N, 1)
-        rbf_norms = self.rbf_fn_one(vel_norms.reshape(-1, 1)).reshape(B, 5, 5,2*self.ef_dim) # (B, N, N, ef_dim)
+        #vel_norms = torch.diag_embed(torch.linalg.vector_norm(vel, ord=2, dim=2)).unsqueeze(3) # (B, N, N, 1)
+        #rbf_norms = self.rbf_fn(vel_norms.reshape(-1, 1)).reshape(B, 5, 5,output_dim) # (B, N, N, ef_dim)
         
+       
         #concatenate along -1 dimension
-        mixed_dist = torch.cat([rbf_coord_dist, rbf_vel_dist, rbf_mixed_dist_coord, rbf_mixed_dist_vel], dim=-1) # (B, N, N, 8*ef_dim)
-        
-        
-        #print(self.rbf_fn_one(coord_dist.reshape(-1, 1)).size())
+        if kemb==None:
+            mixed_dist = torch.cat([rbf_coord_dist, rbf_vel_dist, rbf_mixed_dist_coord, rbf_mixed_dist_vel, torch.zeros(B,5,5, 2*self.mp_dim).cuda()], dim=-1) # (B, N, N, output_dim + hidden_nf)
+        else:
+            mixed_dist = torch.cat([rbf_coord_dist, rbf_vel_dist, rbf_mixed_dist_coord, rbf_mixed_dist_vel, kemb], dim=-1) # (B, N, N, output_dim +2*hidden_nf)
+            
         #run wl
         kemb = self.init_color(mixed_dist)
         for i in range(self.color_steps):
@@ -641,18 +639,20 @@ class E_GCL_vel_hidden(E_GCL):
         
         #assert same sizes
         
-        return kemb[batch, rowidx, colidx]             
+        return kemb[batch, rowidx, colidx], kemb
+                
 
-    def forward(self, h, edge_index, coord, vel, edge_attr=None, node_attr=None):
+    def forward(self, h, edge_index, coord, vel, edge_attr=None, node_attr=None, kemb=None):
         row, col = edge_index
         radial, coord_diff = self.coord2radial(edge_index, coord)
         
         if self.three_channel_in:
-            kemb = self.mixed_wl( edge_index, coord[:,:,0], vel, coord[:,:, 1], vel, coord[:,:, 2])
+          kemb, kemb_next = self.mixed_wl( edge_index, coord[:,:,0], vel, coord[:,:, 1], vel, coord[:,:, 2], kemb)
         elif self.multi_channel_in:
-            kemb = self.mixed_wl( edge_index, coord[:,:,0], vel, coord[:,:, 1], vel)
+          kemb, kemb_next = self.mixed_wl( edge_index, coord[:,:,0], vel, coord[:,:, 1], vel, kemb)
         else:
-          kemb = self.wl( edge_index, coord, vel )
+          kemb, kemb_next = self.wl( edge_index, coord, vel, kemb )
+          
         edge_feat = self.edge_model(h[row], h[col], radial, kemb, edge_attr)
         coord = self.coord_model(coord, edge_index, coord_diff, radial, edge_feat)
 
@@ -663,7 +663,7 @@ class E_GCL_vel_hidden(E_GCL):
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
         # coord = self.node_coord_model(h, coord)
         # x = self.node_model(x, edge_index, x[col], u, batch)  # GCN
-        return h, coord, edge_attr, vel
+        return h, coord, edge_attr, vel, kemb_next
  
 
 class GCL_rf_vel(nn.Module):

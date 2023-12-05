@@ -67,11 +67,14 @@ parser.add_argument('--update_vel', type=eval, default=False, metavar='N',
 
 time_exp_dic = {'time': 0, 'counter': 0}
 
-parser.add_argument('--color_steps', type=int, default=1, metavar='N',
+parser.add_argument('--color_steps', type=int, default=2, metavar='N',
                     help='hidden features for edge mlp and messages')
+parser.add_argument('--mp', type=eval, default=False, metavar='N',
+                    help='use edge hidden state message passing')                   
 parser.add_argument('--ef_dim', type=int, default=3, metavar='N',
                     help='hidden features for node mlp')
-
+parser.add_argument('--clip', type=float, default=1.5, metavar='N',
+                    help='grad clip')
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -125,7 +128,7 @@ def main():
     elif args.model == 'egnn_vel_hidden':
         model = EGNN_vel_hidden(in_node_nf=1, in_edge_nf=2, hidden_edge_nf=args.nf_edge, 
                          hidden_node_nf=args.nf_node, hidden_coord_nf=args.nf_coord,device=device, n_layers=args.n_layers,
-                         recurrent=True, norm_diff=args.norm_diff, tanh=args.tanh, num_vectors=args.num_vectors, update_vel=args.update_vel, color_steps=args.color_steps, ef_dim=args.ef_dim)
+                         recurrent=True, norm_diff=args.norm_diff, tanh=args.tanh, num_vectors=args.num_vectors, update_vel=args.update_vel, color_steps=args.color_steps, ef_dim=args.ef_dim, mp=args.mp)
     elif args.model == 'baseline':
         model = Baseline()
     elif args.model == 'linear_vel':
@@ -146,7 +149,7 @@ def main():
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     num_params = sum([np.prod(p.size()) for p in model_parameters])
     wandb.run.summary['model_params'] = num_params
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, amsgrad=True)
 
     results = {'epochs': [], 'losess': []}
     best_val_loss = 1e8
@@ -252,6 +255,7 @@ def train(model, optimizer, epoch, loader, backprop=True):
         loss = loss_mse(loc_pred, loc_end)
         if backprop:
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), args.clip, norm_type=2.0, error_if_nonfinite=False)
             optimizer.step()
         res['loss'] += loss.item()*batch_size
         res['counter'] += batch_size
